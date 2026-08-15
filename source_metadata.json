@@ -1,0 +1,8 @@
+{
+  "rows": 981,
+  "first_draw": "2012-03-23",
+  "last_draw": "2026-08-14",
+  "schema": "Datum;zahl1;zahl2;zahl3;zahl4;zahl5;euro1;euro2",
+  "source_mirror": "https://raw.githubusercontent.com/rescue3dcom-hub/lotto-data/main/eurojackpot.csv",
+  "official_reference": "https://www.westlotto.de/service/downloads/downloads.html"
+}
