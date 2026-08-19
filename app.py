@@ -19,15 +19,18 @@ from __future__ import annotations
 
 import io
 import math
+import time as time_module
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from itertools import combinations
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(
     page_title="Eurojackpot Predictor 2.3",
@@ -55,6 +58,7 @@ GAMES = {
         "data_url": "https://raw.githubusercontent.com/rescue3dcom-hub/lotto-data/main/eurojackpot.csv",
         "draw_weekdays": [1, 4],
         "draw_names": {1: "Dienstag", 4: "Freitag"},
+        "close_by_weekday": {1: (18, 35), 4: (18, 35)},
         "overlap_limit": 2,
     },
     "6aus49": {
@@ -73,6 +77,7 @@ GAMES = {
         "data_url": "https://raw.githubusercontent.com/daowa89/lottery-archive/main/de/lotto_6aus49/results.csv",
         "draw_weekdays": [2, 5],
         "draw_names": {2: "Mittwoch", 5: "Samstag"},
+        "close_by_weekday": {2: (17, 45), 5: (18, 45)},
         "overlap_limit": 3,
     },
 }
@@ -535,7 +540,7 @@ def select_diverse(candidates, n, overlap_limit, max_pair_reuse=2):
     return selected
 
 
-def predict(df, cfg, n, simulations, seed, modes, damp_last=False):
+def predict(df, cfg, n, simulations, seed, modes, damp_last=False, progress=None):
     rng = np.random.default_rng(int(seed))
     feat = features(df, cfg)
     if not modes:
@@ -543,7 +548,13 @@ def predict(df, cfg, n, simulations, seed, modes, damp_last=False):
 
     per_mode = max(400, simulations // max(len(modes), 1))
     pool = []
-    for mode in modes:
+    n_modes = max(len(modes), 1)
+    for i, mode in enumerate(modes):
+        if progress is not None:
+            progress.progress(
+                i / (n_modes + 1),
+                text=f"Berechne Modell „{mode}“ ({i + 1}/{n_modes}) …",
+            )
         pool.extend(generate_candidates(rng, cfg, feat, mode, per_mode, damp_last))
 
     # Pro Modus vorab die besten, dann mischen – kein Mittelwert über widersprüchliche Heuristiken
@@ -560,7 +571,12 @@ def predict(df, cfg, n, simulations, seed, modes, damp_last=False):
             if i < len(by_mode[m]):
                 interleaved.append(by_mode[m][i])
 
-    return select_diverse(interleaved, n, cfg["overlap_limit"])
+    if progress is not None:
+        progress.progress(n_modes / (n_modes + 1), text="Sortiere und filtere Tipps …")
+    selected = select_diverse(interleaved, n, cfg["overlap_limit"])
+    if progress is not None:
+        progress.progress(1.0, text="Fertig")
+    return selected
 
 
 def random_tickets(rng, cfg, n):
@@ -647,6 +663,250 @@ def expected_main_hits(cfg) -> float:
     return k * k / n
 
 
+def next_submission_deadline(now: datetime, cfg: dict) -> tuple[datetime, date] | None:
+    d = now.date()
+    for _ in range(16):
+        if d.weekday() in cfg["draw_weekdays"]:
+            h, m = cfg.get("close_by_weekday", {}).get(d.weekday(), (18, 0))
+            deadline = now.replace(year=d.year, month=d.month, day=d.day, hour=h, minute=m, second=0, microsecond=0)
+            if deadline > now:
+                return deadline, d
+        d += timedelta(days=1)
+    return None
+
+
+def render_deadline_timer(cfg: dict, tz_name: str = "Europe/Berlin", height: int = 118) -> None:
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    now = datetime.now(tz)
+    nxt = next_submission_deadline(now, cfg)
+    if not nxt:
+        st.caption("Keine Abgabefrist ermittelt.")
+        return
+    deadline, draw_date = nxt
+    wd = cfg["draw_names"].get(draw_date.weekday(), draw_date.strftime("%A"))
+    ts_ms = int(deadline.timestamp() * 1000)
+    html = f"""
+    <div style="font-family:Inter,system-ui,sans-serif;color:#f8fafc;
+                background:#0b1220;border:1px solid #1e293b;border-radius:12px;
+                padding:0.85rem 1rem;">
+      <div style="font-size:0.72rem;color:#94a3b8;font-weight:500;">
+        Abgabefrist · {cfg['label']}
+      </div>
+      <div style="font-size:0.95rem;font-weight:700;margin-top:0.15rem;">
+        {wd} {draw_date.strftime('%d.%m.%Y')} · {deadline.strftime('%H:%M')} Uhr
+      </div>
+      <div id="als-cd" style="font-size:1.35rem;font-weight:800;color:#00e5ff;
+           letter-spacing:-0.03em;margin-top:0.2rem;font-variant-numeric:tabular-nums;">
+        …
+      </div>
+      <div style="font-size:0.68rem;color:#64748b;margin-top:0.25rem;">
+        Richtwert Online. Bundesland / Annahmestelle kann abweichen.
+      </div>
+    </div>
+    <script>
+      const target = {ts_ms};
+      const el = document.getElementById("als-cd");
+      function pad(n) {{ return String(n).padStart(2, "0"); }}
+      function tick() {{
+        const ms = target - Date.now();
+        if (ms <= 0) {{
+          el.textContent = "Abgabe vorbei";
+          el.style.color = "#f87171";
+          return;
+        }}
+        const s = Math.floor(ms / 1000);
+        const d = Math.floor(s / 86400);
+        const h = Math.floor((s % 86400) / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        el.textContent = (d > 0 ? d + "d " : "") + pad(h) + ":" + pad(m) + ":" + pad(sec);
+        el.style.color = s < 3600 ? "#f87171" : (s < 6 * 3600 ? "#fbbf24" : "#00e5ff");
+      }}
+      tick();
+      setInterval(tick, 1000);
+    </script>
+    """
+    components.html(html, height=height)
+
+
+def _ball_html(num: int, kind: str = "main") -> str:
+    if kind == "bonus":
+        bg = "radial-gradient(circle at 32% 28%, #fff7ed, #f97316 42%, #9a3412)"
+        border = "#fb923c"
+    else:
+        bg = "radial-gradient(circle at 32% 28%, #ecfeff, #22d3ee 38%, #0e7490)"
+        border = "#67e8f9"
+    return (
+        f'<span class="lotto-ball" style="background:{bg};border-color:{border};">'
+        f"{int(num):02d}</span>"
+    )
+
+
+def render_top_tip_balls(main, bonus, cfg, score=None, src="") -> None:
+    mains = "".join(_ball_html(x, "main") for x in main)
+    extras = "".join(_ball_html(x, "bonus") for x in bonus)
+    meta = []
+    if src:
+        meta.append(str(src))
+    if score is not None:
+        meta.append(f"Score {score:.4f}")
+    meta_s = " · ".join(meta)
+    st.markdown(
+        f"""
+        <style>
+        .lotto-hero {{
+            background: linear-gradient(180deg, #0b1220, #050508);
+            border: 1px solid #1e293b;
+            border-radius: 18px;
+            padding: 1.15rem 1.25rem 1.3rem;
+            margin: 0.35rem 0 1.1rem 0;
+        }}
+        .lotto-hero-kicker {{
+            font-size: 0.78rem; color: #94a3b8; font-weight: 600;
+            letter-spacing: 0.06em; text-transform: uppercase;
+        }}
+        .lotto-hero-row {{
+            display: flex; flex-wrap: wrap; align-items: center;
+            gap: 0.55rem; margin-top: 0.85rem;
+        }}
+        .lotto-plus {{
+            color: #64748b; font-weight: 800; padding: 0 0.2rem; font-size: 1.2rem;
+        }}
+        .lotto-ball {{
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 54px; height: 54px; border-radius: 50%;
+            color: #082f49; font-weight: 800; font-size: 1.15rem;
+            border: 2px solid #67e8f9;
+            box-shadow: 0 8px 18px rgba(0,0,0,0.35), inset 0 -6px 10px rgba(0,0,0,0.18);
+            font-variant-numeric: tabular-nums;
+        }}
+        .lotto-hero-meta {{ margin-top: 0.7rem; color: #94a3b8; font-size: 0.82rem; }}
+        </style>
+        <div class="lotto-hero">
+          <div class="lotto-hero-kicker">Tipp · Rang 1</div>
+          <div class="lotto-hero-row">
+            {mains}
+            <span class="lotto-plus">+</span>
+            {extras}
+          </div>
+          <div class="lotto-hero-meta">{cfg['label']} · {cfg['bonus_label']}{(' · ' + meta_s) if meta_s else ''}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Splash (gleicher Screen wie AstroLotto)
+# ---------------------------------------------------------------------------
+if not st.session_state.get("splash_done"):
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"], [data-testid="stHeader"], [data-testid="stToolbar"] {
+            display: none !important;
+        }
+        .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+            background: #050508 !important;
+        }
+        .alsplash {
+            position: fixed; inset: 0; z-index: 999999;
+            background:
+                repeating-linear-gradient(0deg, transparent, transparent 39px, rgba(0,229,255,0.06) 40px),
+                repeating-linear-gradient(90deg, transparent, transparent 39px, rgba(0,229,255,0.06) 40px),
+                #050508;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            font-family: Inter, system-ui, sans-serif;
+        }
+        .alsplash-k { width: 220px; height: 220px; margin-bottom: 0.4rem;
+            filter: drop-shadow(0 0 18px rgba(0,229,255,0.55)); }
+        .alsplash-title {
+            font-size: 3.1rem; font-weight: 800; color: #ffffff; letter-spacing: -0.03em;
+            margin: 0.15rem 0 0 0; line-height: 1.05;
+        }
+        .alsplash-sub {
+            font-size: 1.05rem; font-weight: 700; color: #00e5ff;
+            letter-spacing: 0.42em; margin: 0.35rem 0 1.35rem 0;
+        }
+        .alsplash-badge {
+            display: inline-flex; align-items: center; gap: 0.55rem;
+            padding: 0.4rem 0.95rem 0.4rem 0.45rem; border-radius: 999px;
+            background: #0a0a0a; border: 1px solid rgba(0,229,255,0.4);
+            box-shadow: 0 0 14px rgba(0,229,255,0.18);
+            color: #e2e8f0; font-size: 0.95rem; font-weight: 500;
+        }
+        .alsplash-badge strong { color: #00e5ff; }
+        .alsplash-bar {
+            width: min(420px, 70vw); height: 8px; margin-top: 2.2rem;
+            background: #111827; border-radius: 999px; overflow: hidden;
+            box-shadow: 0 0 16px rgba(0,229,255,0.18);
+        }
+        .alsplash-bar > span {
+            display: block; height: 100%; width: 0;
+            background: linear-gradient(90deg, #00b8d4, #00e5ff);
+            border-radius: 999px;
+            animation: alsplash-load 2.5s ease-in-out forwards;
+        }
+        .alsplash-note { margin-top: 1.35rem; color: #64748b; font-size: 0.85rem; }
+        @keyframes alsplash-load { from { width: 0; } to { width: 100%; } }
+        </style>
+        <div class="alsplash">
+          <svg class="alsplash-k" viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="48" cy="30" r="5" fill="#00E5FF"/>
+            <circle cx="48" cy="70" r="4.5" fill="#00E5FF"/>
+            <circle cx="48" cy="100" r="6" fill="#00E5FF"/>
+            <circle cx="48" cy="130" r="4.5" fill="#00E5FF"/>
+            <circle cx="48" cy="170" r="5" fill="#00E5FF"/>
+            <circle cx="78" cy="70" r="4" fill="#00E5FF"/>
+            <circle cx="95" cy="55" r="3.5" fill="#00E5FF"/>
+            <circle cx="112" cy="40" r="4.5" fill="#00E5FF"/>
+            <circle cx="135" cy="28" r="5" fill="#00E5FF"/>
+            <circle cx="78" cy="130" r="4" fill="#00E5FF"/>
+            <circle cx="95" cy="145" r="3.5" fill="#00E5FF"/>
+            <circle cx="112" cy="160" r="4.5" fill="#00E5FF"/>
+            <circle cx="135" cy="172" r="5" fill="#00E5FF"/>
+            <circle cx="70" cy="100" r="3.5" fill="#00E5FF"/>
+            <circle cx="100" cy="100" r="5" fill="#00E5FF"/>
+            <g stroke="#00E5FF" stroke-width="1.4" stroke-linecap="round" opacity="0.9">
+              <line x1="48" y1="30" x2="48" y2="70"/>
+              <line x1="48" y1="70" x2="48" y2="100"/>
+              <line x1="48" y1="100" x2="48" y2="130"/>
+              <line x1="48" y1="130" x2="48" y2="170"/>
+              <line x1="48" y1="100" x2="70" y2="100"/>
+              <line x1="70" y1="100" x2="100" y2="100"/>
+              <line x1="48" y1="70" x2="78" y2="70"/>
+              <line x1="78" y1="70" x2="95" y2="55"/>
+              <line x1="95" y1="55" x2="112" y2="40"/>
+              <line x1="112" y1="40" x2="135" y2="28"/>
+              <line x1="48" y1="100" x2="95" y2="55"/>
+              <line x1="100" y1="100" x2="112" y2="40"/>
+              <line x1="48" y1="130" x2="78" y2="130"/>
+              <line x1="78" y1="130" x2="95" y2="145"/>
+              <line x1="95" y1="145" x2="112" y2="160"/>
+              <line x1="112" y1="160" x2="135" y2="172"/>
+              <line x1="48" y1="100" x2="95" y2="145"/>
+              <line x1="100" y1="100" x2="112" y2="160"/>
+            </g>
+          </svg>
+          <div class="alsplash-title">AstroLotto</div>
+          <div class="alsplash-sub">SCORE</div>
+          <div class="alsplash-badge">
+            Made by <strong>Kaisersoft.ai</strong>
+          </div>
+          <div class="alsplash-bar"><span></span></div>
+          <div class="alsplash-note">Nur zur Unterhaltung · keine Gewinngarantie</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    time_module.sleep(2.7)
+    st.session_state.splash_done = True
+    st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -723,6 +983,8 @@ with st.sidebar:
         value=False,
         help="Nur Komfort für Nutzer, kein statistischer Vorteil.",
     )
+    st.markdown("---")
+    render_deadline_timer(cfg)
 
 if not modes:
     st.error("Mindestens ein Modell auswählen.")
@@ -736,8 +998,32 @@ with tab1:
         "dann rangiert und auf Überschneidung begrenzt. "
         f"Zufallserwartung Hauptzahlen-Hits/Tipp: **{exp_hits:.2f}**."
     )
+    render_deadline_timer(cfg, height=122)
     if st.button("🚀 Berechnen", type="primary"):
-        pred = predict(df, cfg, n, sims, int(seed), modes, damp_last=damp_last)
+        progress = st.progress(0.0, text="Starte Berechnung …")
+        pred = predict(
+            df,
+            cfg,
+            n,
+            sims,
+            int(seed),
+            modes,
+            damp_last=damp_last,
+            progress=progress,
+        )
+        progress.empty()
+        st.session_state.last_pred = {
+            "game": game_key,
+            "pred": pred,
+            "seed": int(seed),
+        }
+        save_predictions(pred, cfg, game_key, seed, modes, sims, df["Datum"].max())
+
+    last = st.session_state.get("last_pred")
+    if last and last.get("game") == game_key and last.get("pred"):
+        pred = last["pred"]
+        top = pred[0]
+        render_top_tip_balls(top[1], top[2], cfg, score=top[0], src=top[3])
         rows = []
         for i, item in enumerate(pred):
             s, m, b, src = item
@@ -752,7 +1038,6 @@ with tab1:
             )
         out = pd.DataFrame(rows)
         st.dataframe(out, hide_index=True, use_container_width=True)
-        save_predictions(pred, cfg, game_key, seed, modes, sims, df["Datum"].max())
         st.download_button(
             "⬇️ CSV",
             out.to_csv(index=False).encode(),
