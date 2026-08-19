@@ -948,11 +948,115 @@ st.markdown(
     .jp-hero-title { font-size: 1.35rem; font-weight: 800; color: #f8fafc;
         letter-spacing: -0.03em; margin: 0 0 0.15rem 0; }
     .jp-hero-sub { font-size: 0.88rem; color: #94a3b8; margin-bottom: 0.85rem; }
+
+    html, body, .stApp {
+        background: #050508 !important;
+    }
+    [data-testid="stAppViewContainer"],
+    [data-testid="stHeader"],
+    [data-testid="stMain"] {
+        background: transparent !important;
+    }
+    section[data-testid="stSidebar"],
+    section[data-testid="stSidebar"] > div,
+    [data-testid="stSidebarContent"] {
+        background-color: #000000 !important;
+        background: #000000 !important;
+        border-right: 1px solid #111111 !important;
+    }
+
+    .jp-mathsky {
+        position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden;
+        background:
+            radial-gradient(ellipse 70% 50% at 80% 0%, rgba(0, 80, 90, 0.18), transparent 55%),
+            radial-gradient(ellipse 50% 40% at 10% 100%, rgba(20, 40, 80, 0.16), transparent 50%),
+            repeating-linear-gradient(0deg, transparent, transparent 47px, rgba(0,229,255,0.04) 48px),
+            repeating-linear-gradient(90deg, transparent, transparent 47px, rgba(0,229,255,0.04) 48px),
+            #050508;
+    }
+    .jp-mathsky .glyph {
+        position: absolute; color: rgba(0, 229, 255, 0.22);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-weight: 600; white-space: nowrap;
+        animation: jp-drift 18s linear infinite;
+    }
+    .jp-mathsky .col {
+        position: absolute; top: -20%;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 13px; line-height: 1.35; letter-spacing: 0.08em;
+        color: rgba(103, 232, 249, 0.16);
+        writing-mode: vertical-rl; text-orientation: mixed;
+        animation: jp-fall linear infinite;
+    }
+    .jp-scan {
+        position: absolute; left: 0; right: 0; height: 2px;
+        background: linear-gradient(90deg, transparent, rgba(0,229,255,0.35), transparent);
+        animation: jp-scan 9s ease-in-out infinite;
+        opacity: 0.5;
+    }
+    .jp-curve {
+        position: absolute; left: 8%; right: 8%; bottom: 8%; height: 22%;
+        opacity: 0.22;
+    }
+    @keyframes jp-drift {
+        0% { transform: translate3d(0, 0, 0); opacity: 0.12; }
+        50% { opacity: 0.32; }
+        100% { transform: translate3d(12px, -28px, 0); opacity: 0.1; }
+    }
+    @keyframes jp-fall {
+        0% { transform: translateY(-10%); opacity: 0; }
+        12% { opacity: 0.35; }
+        100% { transform: translateY(120vh); opacity: 0; }
+    }
+    @keyframes jp-scan {
+        0% { top: 8%; }
+        100% { top: 88%; }
+    }
+    [data-testid="stAppViewContainer"] > .main,
+    [data-testid="stMain"] {
+        position: relative; z-index: 1;
+    }
     </style>
     <div class="jp-hero-title">Jackpot Predictor</div>
     """,
     unsafe_allow_html=True,
 )
+def _math_background_html() -> str:
+    rng = __import__("random").Random(7)
+    glyphs = [
+        "Σ", "μ", "σ", "P(X)", "C(n,k)", "k²/N", "χ²", "E[X]",
+        "∏", "Δ", "H(x)", "p̂", "n=50", "n=49", "log L", "∩",
+    ]
+    bits = ['<div class="jp-mathsky" aria-hidden="true">']
+    bits.append(
+        '<svg class="jp-curve" viewBox="0 0 200 40" preserveAspectRatio="none">'
+        '<path d="M0 34 C 30 34, 50 8, 80 8 S 130 34, 200 34" '
+        'fill="none" stroke="#00e5ff" stroke-width="1.2"/>'
+        '<path d="M0 34 C 30 34, 50 8, 80 8 S 130 34, 200 34 L200 40 L0 40 Z" '
+        'fill="rgba(0,229,255,0.06)"/>'
+        "</svg>"
+    )
+    bits.append('<div class="jp-scan"></div>')
+    for i in range(14):
+        left = rng.uniform(2, 96)
+        delay = rng.uniform(0, 12)
+        dur = rng.uniform(11, 22)
+        text = " ".join(str(rng.randint(0, 50)) for _ in range(18))
+        bits.append(
+            f'<div class="col" style="left:{left:.1f}%;animation-duration:{dur:.1f}s;'
+            f'animation-delay:{delay:.1f}s">{text}</div>'
+        )
+    for i, g in enumerate(glyphs):
+        bits.append(
+            f'<span class="glyph" style="left:{rng.uniform(4,92):.1f}%;'
+            f'top:{rng.uniform(8,78):.1f}%;font-size:{rng.choice([14,16,18,22])}px;'
+            f'animation-delay:{i * 0.4:.1f}s">{g}</span>'
+        )
+    bits.append("</div>")
+    return "".join(bits)
+
+
+st.markdown(_math_background_html(), unsafe_allow_html=True)
 st.caption(
     "Statistisches Ranking & Backtesting – keine Gewinnwahrscheinlichkeit. "
     "Höherer Score heißt nur: besser passend zur gewählten Heuristik. "
@@ -1086,9 +1190,6 @@ with st.sidebar:
         value=False,
         help="Nur Komfort für Nutzer, kein statistischer Vorteil.",
     )
-    st.markdown("---")
-    render_deadline_timer(cfg)
-
 if not modes:
     st.error("Mindestens ein Modell auswählen.")
     st.stop()
