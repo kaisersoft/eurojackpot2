@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import math
+import sqlite3
 import time as time_module
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
@@ -31,6 +32,12 @@ import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+
+try:
+    import libsql
+    HAS_LIBSQL = True
+except ImportError:
+    HAS_LIBSQL = False
 
 st.set_page_config(
     page_title="Jackpot Predictor",
@@ -60,6 +67,24 @@ GAMES = {
         "draw_names": {1: "Dienstag", 4: "Freitag"},
         "close_by_weekday": {1: (18, 35), 4: (18, 35)},
         "overlap_limit": 2,
+        # Offizielle Gewinnklassen: (Hauptzahlen-Treffer, Bonus-Treffer) -> Klasse.
+        # Kombinationen, die hier nicht auftauchen, sind kein Gewinn (Niete).
+        "win_classes": {
+            (5, 2): 1, (5, 1): 2, (5, 0): 3,
+            (4, 2): 4, (4, 1): 5, (3, 2): 6,
+            (4, 0): 7, (2, 2): 8, (3, 1): 9,
+            (3, 0): 10, (1, 2): 11, (2, 1): 12,
+        },
+        "jackpot_class": 1,
+        "field_price": 2.00,
+        # ACHTUNG: Nur grobe, illustrative Schätzwerte aus öffentlich einsehbaren
+        # Durchschnittsangaben - echte Quoten sind pari-mutuel (variieren pro
+        # Ziehung je nach Einsatzsumme & Gewinnerzahl) und NICHT identisch mit
+        # diesen Werten. In der Sidebar frei editierbar/korrigierbar.
+        "avg_quotes": {
+            2: 300_000.0, 3: 120_000.0, 4: 2_500.0, 5: 400.0,
+            6: 155.0, 7: 110.0, 8: 20.0, 9: 30.0, 10: 18.0, 11: 10.0, 12: 8.0,
+        },
     },
     "6aus49": {
         "label": "LOTTO 6aus49",
@@ -79,6 +104,18 @@ GAMES = {
         "draw_names": {2: "Mittwoch", 5: "Samstag"},
         "close_by_weekday": {2: (17, 45), 5: (18, 45)},
         "overlap_limit": 3,
+        "win_classes": {
+            (6, 1): 1, (6, 0): 2, (5, 1): 3, (5, 0): 4,
+            (4, 1): 5, (4, 0): 6, (3, 1): 7, (3, 0): 8, (2, 1): 9,
+        },
+        "jackpot_class": 1,
+        "field_price": 1.30,
+        # Gleicher Disclaimer wie oben: illustrative Schätzwerte, Klasse 2
+        # ("6 Richtige ohne Superzahl") kann real stark abweichen.
+        "avg_quotes": {
+            2: 500_000.0, 3: 50_000.0, 4: 3_000.0, 5: 150.0,
+            6: 35.0, 7: 25.0, 8: 10.0, 9: 5.0,
+        },
     },
 }
 
@@ -593,6 +630,222 @@ def random_tickets(rng, cfg, n):
     return out
 
 
+def next_draw_dates(weekdays, n=3, start=None):
+    out = []
+    d = start or date.today()
+    for _ in range(60):
+        if d.weekday() in weekdays:
+            out.append(d)
+            if len(out) >= n:
+                break
+        d += timedelta(days=1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Ziehungs-Simulation / What-if-P&L (SQLite)
+# ---------------------------------------------------------------------------
+SIM_DB_PATH = DATA_DIR / "simulations.db"
+
+
+def get_sim_db_connection():
+    """Verbindung zur Simulations-DB.
+
+    Nutzt Turso (persistente Cloud-DB über libSQL), wenn TURSO_DATABASE_URL /
+    TURSO_AUTH_TOKEN in st.secrets hinterlegt sind - das ist auf Streamlit
+    Community Cloud zwingend nötig, weil dort KEIN persistentes Dateisystem
+    existiert: eine lokale SQLite-Datei ist bei jedem harten Neustart weg.
+    Ohne Turso-Zugangsdaten (z.B. lokale Entwicklung) fällt die Funktion auf
+    eine lokale SQLite-Datei zurück.
+    """
+    turso_url = None
+    turso_token = None
+    try:
+        turso_url = st.secrets.get("TURSO_DATABASE_URL")
+        turso_token = st.secrets.get("TURSO_AUTH_TOKEN")
+    except Exception:
+        pass  # kein secrets.toml vorhanden - lokaler Fallback greift unten
+
+    if turso_url and turso_token:
+        if not HAS_LIBSQL:
+            raise RuntimeError(
+                "TURSO_DATABASE_URL/TURSO_AUTH_TOKEN gesetzt, aber Paket 'libsql' "
+                "nicht installiert. Bitte 'libsql' in requirements.txt ergänzen."
+            )
+        return libsql.connect(database=turso_url, auth_token=turso_token)
+    return sqlite3.connect(SIM_DB_PATH)
+
+
+def _query_df(con, sql: str, params: tuple = ()) -> pd.DataFrame:
+    """DBAPI2-generischer SELECT->DataFrame-Helper (statt pd.read_sql_query,
+    das nicht garantiert mit einer libsql-Connection zurechtkommt)."""
+    cur = con.execute(sql, params)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+
+def init_sim_db() -> None:
+    con = get_sim_db_connection()
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sim_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game TEXT NOT NULL,
+            draw_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            seed INTEGER,
+            modes TEXT,
+            sims INTEGER,
+            n_tickets INTEGER,
+            price_per_field REAL,
+            status TEXT NOT NULL DEFAULT 'open',
+            settled_at TEXT,
+            total_stake REAL,
+            total_payout REAL,
+            total_profit REAL,
+            jackpot_hit INTEGER DEFAULT 0
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sim_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES sim_runs(id),
+            ticket_no INTEGER NOT NULL,
+            main TEXT NOT NULL,
+            bonus TEXT NOT NULL,
+            source_mode TEXT,
+            score REAL,
+            main_hits INTEGER,
+            bonus_hits INTEGER,
+            win_class INTEGER,
+            payout_est REAL
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+
+def create_sim_run(game_key: str, cfg: dict, pred: list, draw_date: date, seed: int, modes: list, sims: int, price_per_field: float) -> int:
+    """Persistiert eine frisch erzeugte 10er-Simulation für EINE konkrete Ziehung."""
+    init_sim_db()
+    con = get_sim_db_connection()
+    # con.cursor() ist nicht garantiert Teil jeder libsql-API-Version - wir
+    # nutzen stattdessen con.execute() direkt (liefert einen Cursor mit
+    # .lastrowid zurück), analog zur offiziellen Turso-Doku.
+    cur = con.execute(
+        """INSERT INTO sim_runs (game, draw_date, created_at, seed, modes, sims, n_tickets, price_per_field, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+        (
+            game_key,
+            draw_date.isoformat(),
+            datetime.now(timezone.utc).isoformat(),
+            int(seed),
+            ",".join(modes),
+            int(sims),
+            len(pred),
+            float(price_per_field),
+        ),
+    )
+    run_id = cur.lastrowid
+    for i, item in enumerate(pred, 1):
+        s, m, b, src = item[0], item[1], item[2], item[3] if len(item) > 3 else ""
+        con.execute(
+            """INSERT INTO sim_tickets (run_id, ticket_no, main, bonus, source_mode, score)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (run_id, i, " ".join(map(str, m)), " ".join(map(str, b)), src, float(s)),
+        )
+    con.commit()
+    con.close()
+    return run_id
+
+
+def load_sim_runs(game_key: str) -> pd.DataFrame:
+    init_sim_db()
+    con = get_sim_db_connection()
+    df = _query_df(con, "SELECT * FROM sim_runs WHERE game = ? ORDER BY draw_date DESC", (game_key,))
+    con.close()
+    return df
+
+
+def load_sim_tickets(run_id: int) -> pd.DataFrame:
+    con = get_sim_db_connection()
+    df = _query_df(con, "SELECT * FROM sim_tickets WHERE run_id = ? ORDER BY ticket_no", (run_id,))
+    con.close()
+    return df
+
+
+def classify_win(cfg: dict, main_hits: int, bonus_hits: int) -> int | None:
+    """Ordnet eine Trefferkombination der offiziellen Gewinnklasse zu (None = Niete)."""
+    return cfg["win_classes"].get((main_hits, bonus_hits))
+
+
+def settle_open_runs(game_key: str, cfg: dict, df_history: pd.DataFrame, avg_quotes: dict) -> dict:
+    """Gleicht alle offenen Simulationen ab, für die die Ziehung inzwischen in
+    der Historie vorliegt. Reine Was-wäre-wenn-Rechnung mit Schätzquoten."""
+    init_sim_db()
+    con = get_sim_db_connection()
+    open_runs = _query_df(con, "SELECT * FROM sim_runs WHERE game = ? AND status = 'open'", (game_key,))
+    settled, skipped = 0, 0
+    main_cols, bonus_cols = cfg["main_cols"], cfg["bonus_cols"]
+    for _, run in open_runs.iterrows():
+        target_date = pd.Timestamp(run["draw_date"])
+        row = df_history[df_history["Datum"] == target_date]
+        if row.empty:
+            skipped += 1
+            continue
+        row = row.iloc[0]
+        actual_main = {int(row[c]) for c in main_cols}
+        raw_b = row[bonus_cols]
+        if isinstance(raw_b, pd.Series):
+            actual_bonus = {int(x) for x in raw_b.tolist() if pd.notna(x)}
+        else:
+            actual_bonus = {int(raw_b)} if pd.notna(raw_b) else set()
+
+        tickets = _query_df(con, "SELECT * FROM sim_tickets WHERE run_id = ?", (int(run["id"]),))
+        total_payout = 0.0
+        jackpot_hit = 0
+        for _, t in tickets.iterrows():
+            t_main = {int(x) for x in str(t["main"]).split()}
+            t_bonus = {int(x) for x in str(t["bonus"]).split()}
+            mh = len(actual_main & t_main)
+            bh = len(actual_bonus & t_bonus)
+            wc = classify_win(cfg, mh, bh)
+            payout = 0.0
+            if wc is not None:
+                if wc == cfg["jackpot_class"]:
+                    jackpot_hit = 1
+                    payout = 0.0  # Jackpot-Betrag variabel, nicht beziffert
+                else:
+                    payout = float(avg_quotes.get(wc, 0.0))
+            total_payout += payout
+            con.execute(
+                """UPDATE sim_tickets SET main_hits=?, bonus_hits=?, win_class=?, payout_est=?
+                   WHERE id=?""",
+                (mh, bh, wc, payout, int(t["id"])),
+            )
+        stake = float(run["n_tickets"]) * float(run["price_per_field"])
+        con.execute(
+            """UPDATE sim_runs SET status='settled', settled_at=?, total_stake=?,
+               total_payout=?, total_profit=?, jackpot_hit=? WHERE id=?""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                stake,
+                total_payout,
+                total_payout - stake,
+                jackpot_hit,
+                int(run["id"]),
+            ),
+        )
+        settled += 1
+    con.commit()
+    con.close()
+    return {"settled": settled, "skipped": skipped}
+
+
 def save_predictions(pred, cfg, game_key, seed, modes, sims, as_of):
     path = cfg["history_file"]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -621,18 +874,6 @@ def save_predictions(pred, cfg, game_key, seed, modes, sims, as_of):
         old = pd.read_csv(path)
         new = pd.concat([old, new], ignore_index=True)
     new.to_csv(path, index=False)
-
-
-def next_draw_dates(weekdays, n=3, start=None):
-    out = []
-    d = start or date.today()
-    for _ in range(60):
-        if d.weekday() in weekdays:
-            out.append(d)
-            if len(out) >= n:
-                break
-        d += timedelta(days=1)
-    return out
 
 
 def default_seed_from_draw(weekdays) -> int:
@@ -1190,11 +1431,24 @@ with st.sidebar:
         value=False,
         help="Nur Komfort für Nutzer, kein statistischer Vorteil.",
     )
+    st.divider()
+    st.subheader("💶 Ziehungs-Simulation")
+    price_per_field = st.number_input(
+        "Feldpreis (€)",
+        min_value=0.10,
+        max_value=50.0,
+        value=float(st.session_state.get(f"price_{game_key}", cfg["field_price"])),
+        step=0.10,
+        key=f"price_{game_key}",
+        help="Einsatz pro Spielfeld für die What-if-P&L-Simulation (Tab „Ziehungs-Sim (P&L)“).",
+    )
 if not modes:
     st.error("Mindestens ein Modell auswählen.")
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(["🎯 Predictor", "📊 Statistik", "🧪 Backtesting", "🗂️ History"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🎯 Predictor", "📊 Statistik", "🧪 Backtesting", "🗂️ History", "💶 Ziehungs-Sim (P&L)"]
+)
 
 with tab1:
     st.markdown(
@@ -1382,6 +1636,159 @@ with tab4:
         st.dataframe(hist.tail(200), use_container_width=True, hide_index=True)
     else:
         st.info("Noch keine gespeicherten Predictions für dieses Spiel.")
+
+with tab5:
+    st.markdown(
+        "**What-if-Simulation:** Für jede Ziehung, an der du das Tool benutzt, werden "
+        "10 Spielfelder erzeugt und mit Einsatz in einer eigenen Datenbank festgehalten. "
+        "Sobald die echten Gewinnzahlen vorliegen (z.B. zu Monatsbeginn für den Vormonat), "
+        "gleicht der Abgleich alle offenen Simulationen ab und errechnet Gewinn/Verlust."
+    )
+    st.caption(
+        "Reine Nachbetrachtung, keine echten Spielscheine. Gewinnklassen sind der offizielle "
+        f"{cfg['label']}-Gewinnplan; die €-Beträge je Klasse sind **Schätzwerte** (siehe unten), "
+        "da echte Quoten pro Ziehung variieren (pari-mutuel)."
+    )
+
+    quote_key = f"avg_quotes_{game_key}"
+    if quote_key not in st.session_state:
+        st.session_state[quote_key] = dict(cfg["avg_quotes"])
+    with st.expander("⚙️ Schätz-Quoten je Gewinnklasse (editierbar)"):
+        st.caption(
+            "Illustrative Durchschnittswerte, keine offiziellen Quoten. Passe sie an, wenn du "
+            "genauere/aktuellere Werte hast. Die Jackpot-Klasse "
+            f"({cfg['jackpot_class']}) wird separat als 🎉 markiert, nicht in € beziffert."
+        )
+        classes_sorted = sorted(
+            c for c in cfg["win_classes"].values() if c != cfg["jackpot_class"]
+        )
+        cols = st.columns(4)
+        combo_by_class = {v: k for k, v in cfg["win_classes"].items()}
+        for i, wc in enumerate(classes_sorted):
+            mh, bh = combo_by_class[wc]
+            label = f"Kl. {wc} ({mh}+{bh})"
+            with cols[i % 4]:
+                st.session_state[quote_key][wc] = st.number_input(
+                    label,
+                    min_value=0.0,
+                    value=float(st.session_state[quote_key].get(wc, 0.0)),
+                    step=5.0,
+                    key=f"quote_{game_key}_{wc}",
+                )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        nxt = next_draw_dates(cfg["draw_weekdays"], n=1)
+        target_date = nxt[0] if nxt else date.today()
+        st.write(f"**Nächste Ziehung:** {target_date.strftime('%A, %d.%m.%Y')}")
+        if st.button("🎲 10 Felder für diese Ziehung simulieren", type="primary"):
+            sim_seed = int(target_date.strftime("%Y%m%d"))
+            sim_pred = predict(df, cfg, 10, sims, sim_seed, modes, damp_last=damp_last)
+            run_id = create_sim_run(
+                game_key, cfg, sim_pred, target_date, sim_seed, modes, sims, price_per_field
+            )
+            st.success(
+                f"Simulation #{run_id} für {target_date.strftime('%d.%m.%Y')} gespeichert · "
+                f"Einsatz {10 * price_per_field:.2f} € (10 × {price_per_field:.2f} €)."
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Feld": i + 1,
+                            "Hauptzahlen": " ".join(map(str, m)),
+                            cfg["bonus_label"]: " ".join(map(str, b)),
+                            "Modell": src,
+                        }
+                        for i, (s, m, b, src) in enumerate(sim_pred)
+                    ]
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.rerun()
+    with c2:
+        st.write("**Abgleich offener Simulationen**")
+        st.caption("Prüft alle offenen Einträge gegen die geladene Ziehungshistorie.")
+        if st.button("🔎 Jetzt abgleichen"):
+            result = settle_open_runs(game_key, cfg, df, st.session_state[quote_key])
+            if result["settled"]:
+                st.success(f"{result['settled']} Simulation(en) abgeglichen.")
+            if result["skipped"]:
+                st.info(
+                    f"{result['skipped']} offen geblieben – Ziehungsdaten dafür noch nicht "
+                    "in der Historie (ggf. zuerst „Datenfeed prüfen / aktualisieren“)."
+                )
+            if not result["settled"] and not result["skipped"]:
+                st.info("Keine offenen Simulationen.")
+
+    runs = load_sim_runs(game_key)
+    if runs.empty:
+        st.caption("Noch keine Simulationen für dieses Spiel angelegt.")
+    else:
+        settled = runs[runs["status"] == "settled"].copy()
+        open_n = int((runs["status"] == "open").sum())
+        if open_n:
+            st.caption(f"{open_n} Simulation(en) noch offen (Ziehung steht aus oder Daten fehlen).")
+
+        if not settled.empty:
+            settled["Monat"] = pd.to_datetime(settled["draw_date"]).dt.strftime("%Y-%m")
+            monthly = (
+                settled.groupby("Monat")
+                .agg(
+                    Simulationen=("id", "count"),
+                    Einsatz=("total_stake", "sum"),
+                    Auszahlung=("total_payout", "sum"),
+                    Jackpots=("jackpot_hit", "sum"),
+                )
+                .reset_index()
+            )
+            monthly["Gewinn/Verlust"] = monthly["Auszahlung"] - monthly["Einsatz"]
+            monthly["ROI %"] = (monthly["Gewinn/Verlust"] / monthly["Einsatz"] * 100).round(1)
+            st.subheader("📅 Monatsübersicht")
+            st.dataframe(
+                monthly.style.format(
+                    {"Einsatz": "{:.2f} €", "Auszahlung": "{:.2f} €", "Gewinn/Verlust": "{:+.2f} €", "ROI %": "{:+.1f}%"}
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+            tot_stake = settled["total_stake"].sum()
+            tot_payout = settled["total_payout"].sum()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Gesamteinsatz", f"{tot_stake:,.2f} €")
+            m2.metric("Gesamtauszahlung (Schätzung)", f"{tot_payout:,.2f} €")
+            m3.metric("Gewinn/Verlust", f"{tot_payout - tot_stake:+,.2f} €")
+            m4.metric("Jackpot-Treffer", int(settled["jackpot_hit"].sum()))
+            if settled["jackpot_hit"].sum():
+                st.warning(
+                    "🎉 Mindestens ein simuliertes Feld hätte die Jackpot-Klasse getroffen! "
+                    "Der Betrag ist hier nicht beziffert (variabel, mind. 10 Mio. €)."
+                )
+
+            with st.expander("Details je Simulation"):
+                for _, run in settled.sort_values("draw_date", ascending=False).iterrows():
+                    tickets = load_sim_tickets(int(run["id"]))
+                    st.markdown(
+                        f"**{run['draw_date']}** · Einsatz {run['total_stake']:.2f} € · "
+                        f"Auszahlung {run['total_payout']:.2f} € · "
+                        f"P&L {run['total_payout'] - run['total_stake']:+.2f} €"
+                    )
+                    st.dataframe(
+                        tickets[["ticket_no", "main", "bonus", "main_hits", "bonus_hits", "win_class", "payout_est"]].rename(
+                            columns={
+                                "ticket_no": "Feld",
+                                "main": "Hauptzahlen",
+                                "bonus": cfg["bonus_label"],
+                                "main_hits": "Treffer Haupt",
+                                "bonus_hits": "Treffer Bonus",
+                                "win_class": "Gewinnklasse",
+                                "payout_est": "Auszahlung (€)",
+                            }
+                        ),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
 
 with st.expander("Methodik & Datenherkunft"):
     st.markdown(
