@@ -642,6 +642,17 @@ def next_draw_dates(weekdays, n=3, start=None):
     return out
 
 
+def draw_dates_in_month(weekdays, year: int, month: int) -> list[date]:
+    """Alle Ziehungstage eines konkreten Kalendermonats."""
+    d = date(year, month, 1)
+    out = []
+    while d.month == month:
+        if d.weekday() in weekdays:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Ziehungs-Simulation / What-if-P&L (SQLite)
 # ---------------------------------------------------------------------------
@@ -727,6 +738,48 @@ def init_sim_db() -> None:
     )
     con.commit()
     con.close()
+
+
+def existing_sim_dates(game_key: str) -> set:
+    """Menge der Ziehungsdaten (ISO-Strings), für die bereits eine Simulation
+    existiert - egal ob offen oder abgeglichen. Verhindert Doppel-Anlage."""
+    init_sim_db()
+    con = get_sim_db_connection()
+    rows = _query_df(con, "SELECT draw_date FROM sim_runs WHERE game = ?", (game_key,))
+    con.close()
+    return set(rows["draw_date"].tolist()) if not rows.empty else set()
+
+
+def create_sim_runs_for_month(
+    game_key: str, cfg: dict, df: pd.DataFrame, year: int, month: int,
+    sims: int, modes: list, damp_last: bool, price_per_field: float,
+) -> dict:
+    """Legt für JEDEN Ziehungstag eines Monats eine eigene 10er-Simulation an.
+
+    Für Ziehungstage, die zum Zeitpunkt der Ausführung bereits vergangen sind
+    (df enthält das Ergebnis schon), wird die Tipp-Erzeugung - genau wie im
+    Backtesting-Tab (walk-forward) - nur mit Daten VOR diesem Datum gefüttert.
+    Sonst würde die Statistik (Häufigkeit/Paare/Decay) die echten Zahlen des
+    Tages schon kennen, bevor der Tipp dafür erzeugt wird - unfair fürs
+    What-if. Für noch ausstehende Ziehungstage enthält df ohnehin nur Daten
+    von davor, da braucht es keinen zusätzlichen Filter.
+    """
+    existing = existing_sim_dates(game_key)
+    targets = draw_dates_in_month(cfg["draw_weekdays"], year, month)
+    created, skipped = [], []
+    for d in targets:
+        if d.isoformat() in existing:
+            skipped.append(d)
+            continue
+        df_for_gen = df[df["Datum"] < pd.Timestamp(d)]
+        if df_for_gen.empty:
+            skipped.append(d)
+            continue
+        seed = int(d.strftime("%Y%m%d"))
+        pred = predict(df_for_gen, cfg, 10, sims, seed, modes, damp_last=damp_last)
+        run_id = create_sim_run(game_key, cfg, pred, d, seed, modes, sims, price_per_field)
+        created.append((d, run_id))
+    return {"created": created, "skipped": skipped}
 
 
 def create_sim_run(game_key: str, cfg: dict, pred: list, draw_date: date, seed: int, modes: list, sims: int, price_per_field: float) -> int:
@@ -1676,37 +1729,79 @@ with tab5:
                     key=f"quote_{game_key}_{wc}",
                 )
 
+    gen_mode = st.radio(
+        "Erzeugungs-Modus",
+        ["Einzelne (nächste) Ziehung", "Ganzer Monat (alle Ziehungstage auf einmal)"],
+        horizontal=True,
+    )
     c1, c2 = st.columns(2)
     with c1:
-        nxt = next_draw_dates(cfg["draw_weekdays"], n=1)
-        target_date = nxt[0] if nxt else date.today()
-        st.write(f"**Nächste Ziehung:** {target_date.strftime('%A, %d.%m.%Y')}")
-        if st.button("🎲 10 Felder für diese Ziehung simulieren", type="primary"):
-            sim_seed = int(target_date.strftime("%Y%m%d"))
-            sim_pred = predict(df, cfg, 10, sims, sim_seed, modes, damp_last=damp_last)
-            run_id = create_sim_run(
-                game_key, cfg, sim_pred, target_date, sim_seed, modes, sims, price_per_field
+        if gen_mode == "Einzelne (nächste) Ziehung":
+            nxt = next_draw_dates(cfg["draw_weekdays"], n=1)
+            target_date = nxt[0] if nxt else date.today()
+            st.write(f"**Nächste Ziehung:** {target_date.strftime('%A, %d.%m.%Y')}")
+            if target_date.isoformat() in existing_sim_dates(game_key):
+                st.caption("ℹ️ Für dieses Datum existiert bereits eine Simulation.")
+            if st.button("🎲 10 Felder für diese Ziehung simulieren", type="primary"):
+                sim_seed = int(target_date.strftime("%Y%m%d"))
+                sim_pred = predict(df, cfg, 10, sims, sim_seed, modes, damp_last=damp_last)
+                run_id = create_sim_run(
+                    game_key, cfg, sim_pred, target_date, sim_seed, modes, sims, price_per_field
+                )
+                st.success(
+                    f"Simulation #{run_id} für {target_date.strftime('%d.%m.%Y')} gespeichert · "
+                    f"Einsatz {10 * price_per_field:.2f} € (10 × {price_per_field:.2f} €)."
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Feld": i + 1,
+                                "Hauptzahlen": " ".join(map(str, m)),
+                                cfg["bonus_label"]: " ".join(map(str, b)),
+                                "Modell": src,
+                            }
+                            for i, (s, m, b, src) in enumerate(sim_pred)
+                        ]
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                st.rerun()
+        else:
+            ref_date = st.date_input("Referenzdatum (bestimmt den Monat)", value=date.today())
+            month_targets = draw_dates_in_month(cfg["draw_weekdays"], ref_date.year, ref_date.month)
+            already = existing_sim_dates(game_key)
+            open_count = sum(1 for d in month_targets if d.isoformat() not in already)
+            st.write(
+                f"**{ref_date.strftime('%B %Y')}:** {len(month_targets)} Ziehungstag(e) "
+                f"({cfg['draw_names'].get(cfg['draw_weekdays'][0], '')}/"
+                f"{cfg['draw_names'].get(cfg['draw_weekdays'][-1], '')}) · "
+                f"{open_count} noch ohne Simulation."
             )
-            st.success(
-                f"Simulation #{run_id} für {target_date.strftime('%d.%m.%Y')} gespeichert · "
-                f"Einsatz {10 * price_per_field:.2f} € (10 × {price_per_field:.2f} €)."
-            )
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Feld": i + 1,
-                            "Hauptzahlen": " ".join(map(str, m)),
-                            cfg["bonus_label"]: " ".join(map(str, b)),
-                            "Modell": src,
-                        }
-                        for i, (s, m, b, src) in enumerate(sim_pred)
-                    ]
-                ),
-                hide_index=True,
-                use_container_width=True,
-            )
-            st.rerun()
+            if any(d > date.today() for d in month_targets) and any(d <= date.today() for d in month_targets):
+                st.caption(
+                    "Teils vergangene, teils zukünftige Ziehungstage in diesem Monat: für die "
+                    "vergangenen wird die Tipp-Erzeugung automatisch auf Daten *vor* dem "
+                    "jeweiligen Ziehungstag beschränkt (kein Blick in die Zukunft)."
+                )
+            if st.button("🎲 Alle Ziehungstage des Monats simulieren", type="primary", disabled=open_count == 0):
+                result = create_sim_runs_for_month(
+                    game_key, cfg, df, ref_date.year, ref_date.month, sims, modes, damp_last, price_per_field
+                )
+                if result["created"]:
+                    st.success(
+                        f"{len(result['created'])} Simulation(en) angelegt: "
+                        + ", ".join(d.strftime("%d.%m.") for d, _ in result["created"])
+                        + f" · Gesamteinsatz {len(result['created']) * 10 * price_per_field:.2f} €."
+                    )
+                if result["skipped"]:
+                    st.info(
+                        f"{len(result['skipped'])} übersprungen (bereits vorhanden oder keine "
+                        "Historiendaten verfügbar): "
+                        + ", ".join(d.strftime("%d.%m.") for d in result["skipped"])
+                    )
+                st.rerun()
     with c2:
         st.write("**Abgleich offener Simulationen**")
         st.caption("Prüft alle offenen Einträge gegen die geladene Ziehungshistorie.")
